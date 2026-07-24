@@ -110,7 +110,7 @@ function M.str_replace_based_edit_tool(input, opts)
   if input.command == "view" then
     local view = require("avante.llm_tools.view")
     local input_ = { path = input.path }
-    if input.view_range then
+    if input.view_range and type(input.view_range) == "table" then
       local start_line, end_line = unpack(input.view_range)
       input_.start_line = start_line
       input_.end_line = end_line

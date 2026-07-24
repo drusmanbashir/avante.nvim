@@ -106,6 +106,40 @@ describe("llm_tools", function()
     end)
   end)
 
+  describe("str_replace_based_edit_tool view_range guard", function()
+    local edit_tool = LlmTools.str_replace_based_edit_tool
+
+    it("should use a valid array view_range unaffected", function()
+      edit_tool({ command = "view", path = "test.txt", view_range = { 1, 1 } }, {
+        on_log = function() end,
+        on_complete = function(content, err)
+          assert.is_nil(err)
+          assert.equals("test content", vim.json.decode(content).content)
+        end,
+      })
+    end)
+
+    it("should silently ignore a string view_range instead of crashing", function()
+      edit_tool({ command = "view", path = "test.txt", view_range = "bad" }, {
+        on_log = function() end,
+        on_complete = function(content, err)
+          assert.is_nil(err)
+          assert.equals("test content", vim.json.decode(content).content)
+        end,
+      })
+    end)
+
+    it("should silently ignore a number view_range instead of crashing", function()
+      edit_tool({ command = "view", path = "test.txt", view_range = 42 }, {
+        on_log = function() end,
+        on_complete = function(content, err)
+          assert.is_nil(err)
+          assert.equals("test content", vim.json.decode(content).content)
+        end,
+      })
+    end)
+  end)
+
   describe("create_dir", function()
     it("should create new directory", function()
       LlmTools.create_dir({ path = "new_dir" }, {
