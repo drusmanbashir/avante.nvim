@@ -16,6 +16,7 @@ M.__index = M
 ---@field is_dummy? boolean
 ---@field is_user_submission? boolean
 ---@field just_for_display? boolean
+---@field is_queued? boolean
 ---@field visible? boolean
 ---
 ---@param role "user" | "assistant"

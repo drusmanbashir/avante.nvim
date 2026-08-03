@@ -115,10 +115,15 @@ vim.g.avante_login = vim.g.avante_login
 ---@field is_dummy boolean | nil
 ---@field is_compacted boolean | nil
 ---@field is_deleted boolean | nil
+---@field is_queued boolean | nil Whether this is a user submission still sitting in `Sidebar.input_queue`, waiting for the current turn to finish. Used purely for UI badging; API exclusion is handled via `just_for_display`.
 ---@field turn_id string | nil
 ---@field is_calling boolean | nil
 ---@field original_content AvanteLLMMessageContent | nil
 ---@field acp_tool_call? avante.acp.ToolCall | avante.acp.ToolCallUpdate
+
+---@class avante.SidebarQueuedInput
+---@field request string The raw user request text that was submitted while a turn was in progress.
+---@field message avante.HistoryMessage The history message created for display when this request was queued; reused (re-marked) when the request is actually sent, so it is never duplicated.
 
 ---@class AvanteLLMToolResult
 ---@field tool_name string

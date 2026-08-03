@@ -144,6 +144,8 @@ local SIDEBAR_CONTAINERS = {
 ---@field current_tool_use_extmark_id integer | nil
 ---@field private win_size_store table<integer, {width: integer, height: integer}>
 ---@field is_in_full_view boolean
+---@field is_generating boolean Whether a turn is currently in flight; guards `handle_submit` re-entrancy.
+---@field input_queue avante.SidebarQueuedInput[] FIFO queue of requests submitted while `is_generating` was true.
 local Sidebar = {}
 Sidebar.__index = Sidebar
 
@@ -180,6 +182,7 @@ function Sidebar:new(id)
     containers = {},
     file_selector = FileSelector:new(id),
     is_generating = false,
+    input_queue = {},
     chat_history = nil,
     current_state = nil,
     state_timer = nil,
@@ -1946,8 +1949,19 @@ end
 ---@param request string
 ---@param selected_filepaths string[]
 ---@param selected_code AvanteSelectedCode?
+---@param queued boolean|nil Whether this request is still sitting in the input queue, waiting
+---for the current turn to finish before it is actually sent.
 ---@return string
-local function render_chat_record_prefix(timestamp, provider, model, mode, request, selected_filepaths, selected_code)
+local function render_chat_record_prefix(
+  timestamp,
+  provider,
+  model,
+  mode,
+  request,
+  selected_filepaths,
+  selected_code,
+  queued
+)
   local res
   local acp_provider = Config.acp_providers[provider]
   if acp_provider then
@@ -1976,7 +1990,8 @@ local function render_chat_record_prefix(timestamp, provider, model, mode, reque
       .. "\n```"
   end
 
-  return res .. "\n\n> " .. request:gsub("\n", "\n> "):gsub("([%w-_]+)%b[]", "`%0`")
+  local request_prefix = queued and "[queued] " or ""
+  return res .. "\n\n> " .. request_prefix .. request:gsub("\n", "\n> "):gsub("([%w-_]+)%b[]", "`%0`")
 end
 
 local function calculate_config_window_position()
@@ -2021,7 +2036,8 @@ function Sidebar:_get_message_lines(ctx, message, messages, ignore_record_prefix
       message.mode,
       text,
       message.selected_filepaths,
-      message.selected_code
+      message.selected_code,
+      message.is_queued
     )
     local res = {}
     for _, line_ in ipairs(vim.split(prefix, "\n")) do
@@ -2096,6 +2112,8 @@ function Sidebar:get_message_lines(ctx, message, messages, ignore_record_prefix)
     .. tostring(text_len)
     .. ":"
     .. tostring(expanded == true)
+    .. ":"
+    .. tostring(message.is_queued == true)
   local cached_lines = _message_to_lines_lru_cache:get(cache_key)
   if cached_lines then return cached_lines end
   local lines = self:_get_message_lines(ctx, message, messages, ignore_record_prefix)
@@ -2164,7 +2182,8 @@ local function render_message(message, messages, ctx)
       message.mode,
       text,
       message.selected_filepaths,
-      message.selected_code
+      message.selected_code,
+      message.is_queued
     )
     return prefix
   end
@@ -2254,6 +2273,7 @@ end
 
 function Sidebar:clear_history(args, cb)
   self.current_state = nil
+  self.input_queue = {}
   if next(self.chat_history) ~= nil then
     self.chat_history.messages = {}
     self.chat_history.entries = {}
@@ -2372,6 +2392,7 @@ function Sidebar:new_chat(args, cb)
   Path.history.save(self.code.bufnr, history)
   self:reload_chat_history()
   self.current_state = nil
+  self.input_queue = {}
   self.expanded_message_uuids = {}
   self.tool_message_positions = {}
   self.current_tool_use_extmark_id = nil
@@ -2792,11 +2813,37 @@ function Sidebar:submit_input()
 end
 
 ---@param request string
-function Sidebar:handle_submit(request)
+---@param opts? { queued_message?: avante.HistoryMessage } When set, this submission is a queued
+---request being drained after the previous turn finished; `queued_message` is the display
+---message that was created when it was queued, and should be reused (re-marked) rather than
+---duplicated.
+function Sidebar:handle_submit(request, opts)
+  opts = opts or {}
   if Config.prompt_logger.enabled then PromptLogger.log_prompt(request) end
 
   if self.is_generating then
-    self:add_history_messages({ History.Message:new("user", request) })
+    if request == "" then return end
+    local selected_filepaths = self.file_selector:get_selected_filepaths()
+    ---@type AvanteSelectedCode | nil
+    local selected_code = self.code.selection
+      and {
+        path = self.code.selection.filepath,
+        file_type = self.code.selection.filetype,
+        content = self.code.selection.content,
+      }
+    -- Marked `just_for_display` so it is excluded from mid-turn API history rebuilds
+    -- (see `Sidebar:get_history_messages_for_api`) and `is_queued` purely to badge it in the
+    -- UI; it is resubmitted as a fresh turn once the current one finishes (see `on_stop` below).
+    local queued_message = History.Message:new("user", request, {
+      is_user_submission = true,
+      just_for_display = true,
+      is_queued = true,
+      selected_filepaths = selected_filepaths,
+      selected_code = selected_code,
+    })
+    self:add_history_messages({ queued_message })
+    self.input_queue = self.input_queue or {}
+    table.insert(self.input_queue, { request = request, message = queued_message })
     return
   end
 
@@ -2966,16 +3013,37 @@ function Sidebar:handle_submit(request)
     end, 0)
 
     Path.history.save(self.code.bufnr, self.chat_history)
+
+    -- Queue handling: a user-cancelled turn keeps the queue untouched other than handing the
+    -- first item back to the input box for editing/resending; any other completion (including
+    -- a turn that ended with no further tool calls) drains and resubmits the first queued item
+    -- as a brand-new turn, which works uniformly for native and ACP providers since both send a
+    -- fresh prompt from `handle_submit`.
+    if stop_opts.reason == "cancelled" then
+      self:_cancel_return_queued_to_input()
+    else
+      self:_maybe_drain_input_queue()
+    end
   end
 
   if request and request ~= "" then
-    self:add_history_messages({
-      History.Message:new("user", request, {
-        is_user_submission = true,
-        selected_filepaths = selected_filepaths,
-        selected_code = selected_code,
-      }),
-    })
+    if opts.queued_message then
+      -- This request was queued while a previous turn was generating; reuse the display
+      -- message created back then instead of adding a duplicate, un-badge it, and make it
+      -- count towards mid-turn API history again.
+      opts.queued_message.just_for_display = nil
+      opts.queued_message.is_queued = nil
+      self._history_cache_invalidated = true
+      self:update_content("")
+    else
+      self:add_history_messages({
+        History.Message:new("user", request, {
+          is_user_submission = true,
+          selected_filepaths = selected_filepaths,
+          selected_code = selected_code,
+        }),
+      })
+    end
   end
 
   self:get_generate_prompts_options(request, function(generate_prompts_options)
@@ -2996,7 +3064,7 @@ function Sidebar:handle_submit(request)
         Path.history.save(self.code.bufnr, self.chat_history)
       end,
       set_tool_use_store = set_tool_use_store,
-      get_history_messages = function(opts) return self:get_history_messages_for_api(opts) end,
+      get_history_messages = function(api_opts) return self:get_history_messages_for_api(api_opts) end,
       get_todos = function()
         local history = Path.history.load(self.code.bufnr)
         return history.todos
@@ -3034,9 +3102,60 @@ function Sidebar:handle_submit(request)
 
     stream_options.on_memory_summarize = on_memory_summarize
 
-    if request ~= "" then on_state_change("generating") end
+    if request ~= "" then
+      -- Marks the turn as in-flight so a subsequent `handle_submit` call (e.g. the user
+      -- submitting again before this turn finishes) is queued instead of starting a second,
+      -- concurrent generation. Was previously dead: nothing ever set this to true.
+      self.is_generating = true
+      on_state_change("generating")
+    end
     Llm.stream(stream_options)
   end)
+end
+
+---Removes a message from chat history entirely (rather than hiding it), used when a
+---"[queued]" display message is handed back to the input box for editing so it isn't
+---shown both in the input and in the conversation.
+---@param message avante.HistoryMessage
+function Sidebar:_remove_history_message(message)
+  local history_messages = History.get_history_messages(self.chat_history)
+  for idx, msg in ipairs(history_messages) do
+    if msg.uuid == message.uuid then
+      table.remove(history_messages, idx)
+      break
+    end
+  end
+  self.chat_history.messages = history_messages
+  self._history_cache_invalidated = true
+  self:save_history()
+  self:update_content("")
+end
+
+---Pops the first queued input (if any) and resubmits it as a fresh turn, re-entering
+---`handle_submit` the same way a normal user submission does (and therefore reaching ACP
+---providers correctly too, since a fresh turn means a fresh prompt send).
+---@return boolean drained true if a queued item was drained and resubmitted
+function Sidebar:_maybe_drain_input_queue()
+  if not self.input_queue or #self.input_queue == 0 then return false end
+  local entry = table.remove(self.input_queue, 1)
+  self:handle_submit(entry.request, { queued_message = entry.message })
+  return true
+end
+
+---Called when the current turn ends because the user cancelled it. The queue itself is left
+---untouched (no auto-fire, no clear) other than popping its first item back into the input
+---box for editing/resending, and dropping the now-redundant "[queued]" display message for
+---that item so it doesn't show up both in the input and in the conversation.
+function Sidebar:_cancel_return_queued_to_input()
+  if not self.input_queue or #self.input_queue == 0 then return end
+  local entry = table.remove(self.input_queue, 1)
+  self:_remove_history_message(entry.message)
+  if Utils.is_valid_container(self.containers.input) then
+    local lines = vim.split(entry.request, "\n")
+    api.nvim_buf_set_lines(self.containers.input.bufnr, 0, -1, false, lines)
+    api.nvim_set_current_win(self.containers.input.winid)
+    api.nvim_win_set_cursor(self.containers.input.winid, { 1, #lines > 0 and #lines[1] or 0 })
+  end
 end
 
 function Sidebar:initialize_token_count()
